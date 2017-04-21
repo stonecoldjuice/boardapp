@@ -9,6 +9,7 @@ var async = require('async');
 var bodyParser = require('body-parser');
 var methodOverride = require('method-override');
 var LocalStrategy = require('passport-local').Strategy;
+var bcrypt = require('bcrypt-nodejs');
 
 mongoose.connect(process.env.MONGO_DB);
 
@@ -23,6 +24,7 @@ db.on("error", function(err) {
 var postSchema = mongoose.Schema({
     title: {type: String, required: true},
     body: {type: String, required: true},
+    author: {type:mongoose.Schema.Types.ObjectId, ref: 'user', required: true},
     createdAt: {type: Date, default: Date.now},
     updatedAt: Date
 });
@@ -34,6 +36,22 @@ var userSchema = mongoose.Schema({
     password: {type: String, required: true},
     createdAt: {type: Date, default:Date.now}
 });
+userSchema.pre("save", function(next) {
+    var user = this;
+    if (!user.isModified("password")) {
+        return next();
+    } else {
+        user.password = bcrypt.hashSync(user.password);
+        return next();
+    }
+})
+userSchema.methods.authenticate = function(password) {
+    var user = this;
+    return bcrypt.compareSync(password, user.password);
+}
+userSchema.methods.hash = function(password) {
+    return bcrypt.hashSync(password);
+}
 var User = mongoose.model('user', userSchema);
 
 app.set("view engine", 'ejs');
@@ -70,7 +88,7 @@ passport.use('local-login',
                 req.flash("email", req.body.email);
                 return done(null, false, req.flash('loginError', 'No user found'));
             }
-            if (user.password != password) {
+            if (!user.authenticate(password)) {
                 req.flash("email", req.body.email);
                 return done(null, false, req.flash('loginError', 'Password does not Match'));
             }
@@ -129,6 +147,9 @@ app.get('/users/:id', function(req, res) {
     });
 });
 app.get('/usesrs/:id/edit', function(req, res) {
+    if (req.user._id != req.params.id) {
+        return res.json({success: false, message: "Unauthrized Attempt"});
+    }
     User.findById(req.params.id, function(err, user) {
         if (err) {
             return res.json({success: false, message: err}); 
@@ -147,9 +168,9 @@ app.put('/users/:id', checkUserRegValidation, function(req, res) {
         if (err) {
             return res.json({success: "false", message: err});
         }
-        if (req.body.user.password == user.password) {
+        if (user.authenticate(req.body.user.password)) {
             if (req.body.user.newPassword) {
-                req.body.user.password = req.body.user.newPassword;
+                req.body.user.password = user.hash(req.body.user.newPassword);
             } else {
                 delete req.body.user.password;
             }
@@ -168,17 +189,18 @@ app.put('/users/:id', checkUserRegValidation, function(req, res) {
     });
 });
 app.get('/posts', function(req, res) {
-    Post.find({}).sort('-createdAt').exec(function(err, posts) {
+    Post.find({}).populate("author").sort('-createdAt').exec(function(err, posts) {
         if (err) {
             return res.json({success: false, message: err});
         }
         res.render("posts/index", {data: posts, user: req.user});
     });
 });
-app.get('/posts/new', function(req, res) {
-    res.render("posts/new");
+app.get('/posts/new', isLoggedIn, function(req, res) {
+    res.render("posts/new", {user: req.user});
 });
-app.post('/posts', function(req, res) {
+app.post('/posts', isLoggedIn, function(req, res) {
+    req.body.post.author = req.user._id;
     Post.create(req.body.post, function(err, post) {
         if (err) {
             return res.json({success: false, message: err});
@@ -187,11 +209,11 @@ app.post('/posts', function(req, res) {
     })
 })
 app.get('/posts/:id', function(req, res) {
-    Post.findById(req.params.id, function(err, post) {
+    Post.findById(req.params.id).populate("author").exec(function(err, post) {
         if (err) {
             res.json({success: false, message: err});
         }
-        res.render("posts/show", {data: post});
+        res.render("posts/show", {data: post, user: req.user});
     });
 });
 app.get('/posts/:id/edit', function(req, res) {
@@ -199,29 +221,55 @@ app.get('/posts/:id/edit', function(req, res) {
         if (err) {
             return res.json({success: false, message: err});
         }
-        res.render("posts/edit", {data: post});
+        if (!req.user._id.equals(post.author)) {
+            return res.json({success: false, message: "Unauthorized Attempt"});
+        }
+        res.render("posts/edit", {data: post, user: req.user});
     })
 })
 app.put('/posts/:id', function(req, res) {
     req.body.post.updatedAt=Date.now();
-    Post.findByIdAndUpdate(req.params.id, req.body.post, function(err, post) {
+    Post.findById(req.params.id, function(err, post) {
         if (err) {
             return res.json({success: false, message: err});
         }
-        res.redirect('/posts/' + req.params.id);
+        if (!req.user._id.equals(post.author)) {
+            return res.json({success: false, message: "Unauthorized Attempt"});
+        }
+        Post.findByIdAndUpdate(req.params.id, req.body.post, function(err, post) {
+            if (err) {
+                return res.json({success: false, message: err});
+            }
+            res.redirect('/posts/' + req.params.id);
+        });
     });
 });
 app.delete('/posts/:id', function(req, res) {
-    Post.findByIdAndRemove(req.params.id, function(err, post) {
+    Post.findById(req.params.id, function(err, post) {
         if (err) {
             return res.json({success: false, message: err});
         }
-        res.redirect('/posts');
-    });
+        if (!req.user._id.equals(post.author)) {
+            return res.json({success: false, message: "Unauthorized Attempt"});
+        }
+        Post.findByIdAndRemove(req.params.id, function(err, post) {
+            if (err) {
+                return res.json({success: false, message: err});
+            }
+            res.redirect('/posts');
+        });
+    })
 });
 app.listen(3000, function() {
     console.log('Server On!');
 });
+
+function isLoggedIn(req, res, next) {
+    if (req.isAuthenticated()) {
+        return next();
+    }
+    res.redirect('/posts');
+}
 
 function checkUserRegValidation(req, res, next) {
     var isValid = true;
